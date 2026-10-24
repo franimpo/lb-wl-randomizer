@@ -1,0 +1,28 @@
+name: Daily Letterboxd sync
+on:
+  schedule:
+    - cron: '0 8 * * *'  # 05:00 Buenos Aires (UTC-3)
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+      - run: python scripts/sync.py
+        env:
+          LETTERBOXD_USERNAME: franimpo
+      - name: Commit snapshots if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/watchlist.csv data/watchlist.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Update Letterboxd watchlist"
+            git push
+          fi
