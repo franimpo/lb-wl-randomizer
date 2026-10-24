@@ -1,7 +1,5 @@
-"""Enrich Letterboxd snapshots with verified TMDB runtimes and posters.
-
-Requires TMDB_READ_ACCESS_TOKEN in the environment. Reuses previously verified
-matches from data/tmdb_cache.json, querying only unseen / unresolved entries.
+"""Enrich Letterboxd public watchlist with TMDB runtime and poster.
+Requires TMDB_READ_ACCESS_TOKEN GitHub Actions secret.
 """
 import csv
 import json
@@ -11,7 +9,6 @@ import time
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote
 
 import requests
 
@@ -19,109 +16,126 @@ ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / 'data'
 TOKEN = os.environ.get('TMDB_READ_ACCESS_TOKEN', '').strip()
 API = 'https://api.themoviedb.org/3'
-HEADERS = {'Authorization': f'Bearer {TOKEN}', 'Accept': 'application/json'}
 SESSION = requests.Session()
-SESSION.headers.update(HEADERS)
+SESSION.headers.update({'Authorization': f'Bearer {TOKEN}', 'Accept': 'application/json'})
 
+def clean_title(value):
+    return re.sub(r'\s*\(\d{4}\)\s*$', '', str(value or '')).strip()
 
 def normalized(value):
     value = unicodedata.normalize('NFKD', str(value or ''))
     value = ''.join(c for c in value if not unicodedata.combining(c))
     return re.sub(r'[^a-z0-9]+', ' ', value.casefold()).strip()
 
-
-def request(path, params=None):
+def get(path, params=None):
     for attempt in range(5):
-        response = SESSION.get(API + path, params=params, timeout=30)
+        try:
+            response = SESSION.get(API + path, params=params, timeout=30)
+        except requests.RequestException:
+            if attempt == 4:
+                raise
+            time.sleep(2 ** attempt)
+            continue
+        if response.status_code in (401, 403):
+            raise RuntimeError('TMDB authentication failed (401/403). Verify TMDB_READ_ACCESS_TOKEN is the API Read Access Token and is passed to the Action.')
         if response.status_code in (429, 500, 502, 503, 504):
+            if attempt == 4:
+                response.raise_for_status()
             time.sleep(min(2 ** attempt, 20))
             continue
         response.raise_for_status()
         return response.json()
-    raise RuntimeError('TMDB rate limit/server error after 5 attempts')
-
+    raise RuntimeError('TMDB request failed after retries')
 
 def fetch_match(movie):
-    name = (movie.get('name') or '').strip()
+    title = clean_title(movie.get('name'))
     year = str(movie.get('year') or '').strip()
-    if not name:
+    if not title:
         return None
-    results = request('/search/movie', {'query': name, 'year': year} if year.isdigit() else {'query': name}).get('results', [])
-    n = normalized(name)
+    params = {'query': title}
+    if re.fullmatch(r'\d{4}', year):
+        params['year'] = year
+    results = get('/search/movie', params).get('results', [])
+    n = normalized(title)
     exact = []
-    for result in results:
-        names = {normalized(result.get('title')), normalized(result.get('original_title'))}
-        if n not in names:
+    for candidate in results:
+        if n not in (normalized(candidate.get('title')), normalized(candidate.get('original_title'))):
             continue
-        release_year = str(result.get('release_date') or '')[:4]
-        if year.isdigit() and release_year and abs(int(release_year) - int(year)) > 1:
+        released = str(candidate.get('release_date') or '')[:4]
+        if year.isdigit() and released.isdigit() and abs(int(released) - int(year)) > 1:
             continue
-        exact.append(result)
-    # Avoid false positive matches: no duration for ambiguous or unmatched titles.
+        exact.append(candidate)
     if len(exact) != 1:
-        return None
-    selected = exact[0]
-    details = request('/movie/' + str(selected['id']))
+        return None  # Never assign dubious matches
+    details = get('/movie/' + str(exact[0]['id']))
     runtime = details.get('runtime')
-    if not isinstance(runtime, int) or runtime <= 0:
-        return None
-    poster = details.get('poster_path')
-    return {'tmdb_id': details['id'], 'runtime': runtime,
-            'tmdb_poster': ('https://image.tmdb.org/t/p/w500' + poster) if poster else '',
-            'verified_at': datetime.now(timezone.utc).isoformat()}
-
+    poster_path = details.get('poster_path')
+    poster = ('https://image.tmdb.org/t/p/w500' + poster_path) if poster_path else ''
+    return {
+        'tmdb_id': details['id'],
+        'runtime': runtime if isinstance(runtime, int) and runtime > 0 else None,
+        'tmdb_poster': poster,
+        'verified_at': datetime.now(timezone.utc).isoformat(),
+    }
 
 def main():
     if not TOKEN:
-        raise SystemExit('TMDB_READ_ACCESS_TOKEN is missing. Add it to GitHub Actions secrets.')
-    dataset_file = DATA / 'watchlist.json'
-    if not dataset_file.exists():
-        raise SystemExit('Run scripts/sync.py first to create data/watchlist.json')
-    dataset = json.loads(dataset_file.read_text(encoding='utf-8'))
-    movies = dataset.get('movies') or []
-    cache_file = DATA / 'tmdb_cache.json'
-    cache = json.loads(cache_file.read_text(encoding='utf-8')) if cache_file.exists() else {}
-    matched = 0
-    missing = 0
+        raise RuntimeError('Missing TMDB_READ_ACCESS_TOKEN GitHub Actions secret')
+    # Validate credentials even if every film is already cached.
+    get('/configuration')
+    source = DATA / 'watchlist.json'
+    dataset = json.loads(source.read_text(encoding='utf-8'))
+    movies = dataset.get('movies', [])
+    if not movies:
+        raise RuntimeError('Empty watchlist')
+    cache_path = DATA / 'tmdb_cache.json'
+    cache = json.loads(cache_path.read_text(encoding='utf-8')) if cache_path.exists() else {}
+    matched = posters = runtimes = 0
     for i, movie in enumerate(movies, 1):
         key = movie.get('url') or normalized(movie.get('name')) + ':' + str(movie.get('year'))
         entry = cache.get(key)
-        if entry is None:
+        # Refresh cache entries lacking both poster and runtime; otherwise reuse.
+        if not entry or (not entry.get('tmdb_poster') and not entry.get('runtime')):
             try:
                 entry = fetch_match(movie)
-            except requests.RequestException as e:
-                # A temporary API error must not wipe known runtimes or stop the whole sync.
-                print(f'API error for {movie.get("name")}: {e}', flush=True)
-                entry = None
+            except requests.RequestException as exc:
+                raise RuntimeError(f'TMDB network/API error while looking up {movie.get("name")}: {exc}') from exc
             if entry:
                 cache[key] = entry
             time.sleep(0.12)
+        poster = movie.get('poster') or ''
+        if 'empty-poster' in poster:
+            poster = ''
         if entry:
-            movie['runtime'] = entry['runtime']
-            movie['tmdb_id'] = entry['tmdb_id']
-            movie['poster'] = entry.get('tmdb_poster') or movie.get('poster') or ''
             matched += 1
+            movie['tmdb_id'] = entry.get('tmdb_id')
+            movie['runtime'] = entry.get('runtime')
+            poster = entry.get('tmdb_poster') or poster
         else:
             movie['runtime'] = None
-            missing += 1
+            movie.pop('tmdb_id', None)
+        movie['poster'] = poster
+        posters += bool(poster)
+        runtimes += isinstance(movie['runtime'], int) and movie['runtime'] > 0
         if i % 100 == 0:
             print(f'Processed {i}/{len(movies)}', flush=True)
-    dataset['movies'] = movies
-    dataset['runtime_matches'] = matched
-    dataset['runtime_missing'] = missing
-    tmp = dataset_file.with_suffix('.json.tmp')
-    tmp.write_text(json.dumps(dataset, ensure_ascii=False, indent=2), encoding='utf-8')
-    tmp.replace(dataset_file)
-    csv_file = DATA / 'watchlist.csv'
-    fields = ['name','year','url','poster','runtime','tmdb_id']
-    tmp_csv = csv_file.with_suffix('.csv.tmp')
-    with tmp_csv.open('w', newline='', encoding='utf-8') as fp:
-        writer = csv.DictWriter(fp, fieldnames=fields, extrasaction='ignore')
+    if matched == 0:
+        raise RuntimeError('No movies matched TMDB. Aborting without publishing empty enrichment.')
+    dataset.update(movies=movies, runtime_matches=runtimes, poster_matches=posters)
+    json_tmp = source.with_suffix('.json.tmp')
+    json_tmp.write_text(json.dumps(dataset, ensure_ascii=False, indent=2), encoding='utf-8')
+    json_tmp.replace(source)
+    csv_path = DATA / 'watchlist.csv'
+    csv_tmp = csv_path.with_suffix('.csv.tmp')
+    with csv_tmp.open('w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=['name', 'year', 'url', 'poster', 'runtime', 'tmdb_id'], extrasaction='ignore')
         writer.writeheader()
         writer.writerows(movies)
-    tmp_csv.replace(csv_file)
-    cache_file.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding='utf-8')
-    print(f'TMDB enriched {matched}/{len(movies)}; unresolved {missing}', flush=True)
+    csv_tmp.replace(csv_path)
+    cache_tmp = cache_path.with_suffix('.json.tmp')
+    cache_tmp.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding='utf-8')
+    cache_tmp.replace(cache_path)
+    print(f'TMDB verified matches: {matched}/{len(movies)}; posters: {posters}; runtimes: {runtimes}', flush=True)
 
 if __name__ == '__main__':
     main()
