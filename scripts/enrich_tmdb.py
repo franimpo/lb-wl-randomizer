@@ -42,7 +42,11 @@ def request(path, params=None):
 
 
 def fetch_match(movie):
-    name = (movie.get('name') or '').strip()
+   name = re.sub(
+    r'\s*\(\d{4}\)\s*$',
+    '',
+    (movie.get('name') or '').strip()
+).strip()
     year = str(movie.get('year') or '').strip()
     if not name:
         return None
@@ -89,7 +93,12 @@ def main():
         if entry is None:
             try:
                 entry = fetch_match(movie)
-            except requests.RequestException as e:
+                except requests.RequestException as e:
+              if isinstance(e, requests.HTTPError) and e.response is not None:
+                    if e.response.status_code in (401, 403):
+                        raise RuntimeError(
+                            "TMDB rechazó el token. Revisar TMDB_READ_ACCESS_TOKEN"
+                        ) from e
                 # A temporary API error must not wipe known runtimes or stop the whole sync.
                 print(f'API error for {movie.get("name")}: {e}', flush=True)
                 entry = None
@@ -106,6 +115,11 @@ def main():
             missing += 1
         if i % 100 == 0:
             print(f'Processed {i}/{len(movies)}', flush=True)
+                if matched == 0:
+        raise RuntimeError(
+            "TMDB no devolvió ninguna duración. "
+            "Revisar autenticación y coincidencias."
+        )
     dataset['movies'] = movies
     dataset['runtime_matches'] = matched
     dataset['runtime_missing'] = missing
