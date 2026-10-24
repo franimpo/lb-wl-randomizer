@@ -1,6 +1,6 @@
 {
   "username": "franimpo",
-  "updated_at": "2026-10-24T21:26:20.903115+00:00",
+  "updated_at": "2026-10-24T21:33:10.489568+00:00",
   "count": 1031,
   "movies": [
     {
@@ -7220,5 +7220,7 @@
       "poster": "https://s.ltrbxd.com/static/img/empty-poster-125-AiuBHVCI.png",
       "runtime": null
     }
-  ]
+  ],
+  "runtime_matches": 0,
+  "runtime_missing": 1031
 }
