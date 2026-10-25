@@ -1,42 +1,28 @@
-# What to Watch? v2 — Letterboxd Multiusuario
+# Letterboxd Randomizer — v2.1
 
-Sitio público para sortear películas de watchlists públicas de Letterboxd, con filtros por duración, año, década, género y país de producción. URL compartible `/u/usuario`.
+Correcciones de filtros, imágenes y enriquecimiento con TMDB.
 
-## Publicar en Netlify
+## Publicación
 
-1. Subí todo este proyecto a un **repositorio nuevo** en GitHub, o preservá tu proyecto anterior en una rama/copia si preferís reemplazarlo.
-2. En Netlify, importá el repositorio. Build command: `echo Static frontend ready` (configurado en `netlify.toml`). Publish directory: `public`.
-3. Configurá una variable de entorno **TMDB_READ_ACCESS_TOKEN** en Netlify → Project configuration → Environment variables, disponible para Functions. Es el **API Read Access Token** (Bearer) de TMDB, no la API Key corta. Redeploy después de guardarla.
-4. Probá `/u/franimpo`. En la primera visita se consulta Letterboxd y se guarda un caché compartido con Netlify Blobs por 24 horas.
+1. Subí el contenido de este proyecto a tu repositorio (reemplazá archivos existentes).
+2. Netlify: carpeta de publicación `public`. El `netlify.toml` incluido configura las Functions y rutas.
+3. En Netlify > Project configuration > Environment variables, agregá `TMDB_READ_ACCESS_TOKEN` (TMDB API Read Access Token, no API key) en el scope Functions.
+4. Hacé un deploy nuevo. Probá `/u/franimpo`.
 
-## Limitaciones de esta versión de prueba
+## Qué cambia
 
-- La extracción depende del HTML público de Letterboxd; el scraper no está validado contra una descarga real desde este entorno. Si Letterboxd cambia su HTML o bloquea tráfico desde Netlify, la app explica el fallo y permite importar `watchlist.csv` en el navegador (sin enviarlo al servidor).
-- Las watchlists privadas no están soportadas.
-- La sincronización es **lazy**: al visitar la URL tras 24 horas se vuelve a consultar. No es una actualización activa en segundo plano para todos los usuarios.
-- La primera carga de una lista muy grande puede llegar al tiempo máximo de una Function, dependiendo de Letterboxd. Por eso esto es una beta, no una infraestructura a escala para miles de usuarios.
-- Por límites de tiempo de las Functions, TMDB enriquece hasta **12 películas por visita**; visitas posteriores recuperan otras 12. Los filtros avanzados solamente incluirán las películas que ya tienen esos metadatos. No se inventan imágenes ni duraciones.
-- Para escalar y procesar listas grandes de forma fiable: cola de trabajos + worker programado + base de datos. No implementados en este ZIP.
-- Importación CSV local incluye año y nombre, pero sin datos TMDB; permite sortear por año/década.
-- No se crea ningún workflow de GitHub Actions porque esta versión ya no está limitada a `franimpo`.
+- Se elimina el filtro de año; se conserva década.
+- Las películas se enriquecen con TMDB en **lotes de ocho**; el cliente solicita lotes sucesivos mientras haya pendientes.
+- Cada lote se almacena en Netlify Blobs para que visitas posteriores reutilicen resultados.
+- En la interfaz aparece un contador de identificadas y pendientes.
+- Búsquedas TMDB con título limpio, coincidencia con título original y margen de un año; no se asignan datos dudosos.
+- Un error de autenticación TMDB detiene las consultas y muestra un mensaje explícito.
+- Si no existe duración en TMDB, esa película no se incluye en un filtro de duración máxima; el contador indica el motivo.
 
-## Probar localmente
+## Limitaciones
 
-```bash
-npm install
-npm run dev
-```
-
-Netlify CLI inicia la web y las Functions. Abrí la URL local que indique.
-
-## Datos y privacidad
-
-Solo se consulta información pública de Letterboxd y se guardan copias en la caché del sitio. No se requiere ni almacena contraseña de Letterboxd. Nunca exponer `TMDB_READ_ACCESS_TOKEN` en el frontend. Para un lanzamiento público revisá los términos, la posibilidad de bloqueo y los límites aplicables.
-
-## Corrección de extracción (25 Oct 2026)
-
-El parser ahora reconoce también `data-target-link`, `data-film-slug`, `data-item-name`, `li.griditem` y variantes del HTML, y registra en los logs la cantidad de películas detectadas por página.
-
-Si sigue mostrando un error de Cloudflare o acceso automatizado, no es posible resolverlo solamente cambiando selectores. La importación CSV se mantiene como alternativa y se necesitará evaluar un mecanismo autorizado de sincronización.
-
-**Esta actualización no fue validada contra una respuesta HTML real de Letterboxd desde Netlify.**
+- La importación local CSV sigue sin obtener metadatos de TMDB porque se procesa solo en el navegador.
+- Las watchlists grandes pueden requerir varias solicitudes para enriquecer la totalidad; mantené la pestaña abierta durante la primera carga.
+- Si Letterboxd bloquea la extracción a Netlify, la corrección de TMDB no resuelve dicho bloqueo.
+- Los créditos y las condiciones de uso de las APIs de TMDB y Letterboxd deben respetarse si la app se distribuye públicamente.
+- Pruebas realizadas: verificación de sintaxis de JavaScript; aún falta probar la ejecución real en Netlify con el token.

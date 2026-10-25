@@ -75,60 +75,78 @@ async function scrape(username){
   }
   return [...all.values()];
 }
+function titleKey(value){
+  return cleanTitle(value).normalize('NFKD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/[^a-z0-9]+/g,' ').trim();
+}
+async function tmdbFetch(url, token){
+  const response=await fetch(url,{headers:{Authorization:`Bearer ${token}`,Accept:'application/json'},signal:AbortSignal.timeout(12000)});
+  if(response.status===401 || response.status===403)throw Error(`TMDB rechazó la autenticación (${response.status}). Comprobá TMDB_READ_ACCESS_TOKEN en Netlify y volvé a desplegar.`);
+  if(response.status===429)throw Error('TMDB alcanzó su límite de consultas. Intentá de nuevo más tarde.');
+  if(!response.ok)throw Error(`TMDB respondió HTTP ${response.status}`);
+  return response.json();
+}
 async function enrich(movie,token,store){
-  if(!token)return movie;
-  const key=`film-${encodeURIComponent((movie.name+'-'+(movie.year||'')).toLowerCase())}`;
-  try {
-    const cached=await store.get(key,{type:'json'});
-    if(cached && cached.checkedAt && Date.now()-cached.checkedAt<90*DAY)return {...movie,...cached.fields};
-    const headers={Authorization:`Bearer ${token}`,Accept:'application/json'};
-    const params=new URLSearchParams({query:movie.name,include_adult:'false'});
-    if(movie.year)params.set('year',String(movie.year));
-    const sr=await fetch(`https://api.themoviedb.org/3/search/movie?${params}`,{headers,signal:AbortSignal.timeout(10000)});
-    if(sr.status===401||sr.status===403)throw Error('Token de TMDB inválido o sin autorización.');
-    if(!sr.ok)return movie;
-    const results=(await sr.json()).results||[];
-    const same=results.find(x=>x.title?.toLowerCase()===movie.name.toLowerCase() && (!movie.year||Math.abs(Number(x.release_date?.slice(0,4))-movie.year)<=1));
-    const match=same||results.find(x=>(!movie.year||Number(x.release_date?.slice(0,4))===movie.year) && x.title?.toLowerCase()===movie.name.toLowerCase());
-    if(!match)return movie;
-    const dr=await fetch(`https://api.themoviedb.org/3/movie/${match.id}`,{headers,signal:AbortSignal.timeout(10000)});
-    if(!dr.ok)return movie;
-    const detail=await dr.json();
-    const fields={runtime:Number(detail.runtime)||null, poster:detail.poster_path?`https://image.tmdb.org/t/p/w500${detail.poster_path}`:null, genres:(detail.genres||[]).map(x=>x.name),countries:(detail.production_countries||[]).map(x=>x.iso_3166_1),tmdbId:match.id};
-    await store.setJSON(key,{checkedAt:Date.now(),fields});
-    return {...movie,...fields};
-  }catch(e){if(String(e.message).includes('Token de TMDB'))throw e;return movie;}
+  const key=`tmdb-${encodeURIComponent(titleKey(movie.name)+'-'+(movie.year||'sin-ano'))}`;
+  const cached=await store.get(key,{type:'json'});
+  if(cached && Date.now()-cached.checkedAt<(cached.matched?90:7)*DAY)
+    return {...movie,...(cached.fields||{}),metadataChecked:true};
+  const params=new URLSearchParams({query:cleanTitle(movie.name),include_adult:'false'});
+  if(movie.year)params.set('year',String(movie.year));
+  let results=(await tmdbFetch(`https://api.themoviedb.org/3/search/movie?${params}`,token)).results||[];
+  const valid=r=>[r.title,r.original_title].some(t=>titleKey(t)===titleKey(movie.name)) && (!movie.year || Math.abs(Number(r.release_date?.slice(0,4))-movie.year)<=1);
+  let match=results.find(valid);
+  if(!match && movie.year){
+    params.delete('year');
+    results=(await tmdbFetch(`https://api.themoviedb.org/3/search/movie?${params}`,token)).results||[];
+    match=results.find(valid);
+  }
+  if(!match){
+    await store.setJSON(key,{checkedAt:Date.now(),matched:false,fields:{}});
+    return {...movie,metadataChecked:true};
+  }
+  const detail=await tmdbFetch(`https://api.themoviedb.org/3/movie/${match.id}`,token);
+  const fields={runtime:Number(detail.runtime)||null,poster:detail.poster_path?`https://image.tmdb.org/t/p/w500${detail.poster_path}`:null,genres:(detail.genres||[]).map(g=>g.name),countries:(detail.production_countries||[]).map(c=>c.iso_3166_1),tmdbId:match.id};
+  await store.setJSON(key,{checkedAt:Date.now(),matched:true,fields});
+  return {...movie,...fields,metadataChecked:true};
+}
+async function enrichBatch(data,token,store){
+  if(!token)return {...data,warning:'TMDB_READ_ACCESS_TOKEN no está disponible en Netlify Functions.',enrichmentPending:data.movies.filter(m=>!(m.metadataChecked||m.tmdbId)).length};
+  const pending=data.movies.map((m,i)=>!(m.metadataChecked||m.tmdbId)?i:-1).filter(i=>i>=0);
+  if(!pending.length)return {...data,enrichmentPending:0,warning:undefined};
+  const batch=pending.slice(0,8);
+  // A small batch keeps requests well within Netlify Function execution time limits.
+  const results=await Promise.all(batch.map(async i=>({index:i,movie:await enrich(data.movies[i],token,store)})));
+  const movies=[...data.movies];
+  for(const {index,movie} of results)movies[index]=movie;
+  return {...data,movies,enrichmentPending:movies.filter(m=>!(m.metadataChecked||m.tmdbId)).length,warning:undefined};
 }
 export default async (request)=>{
   const u=new URL(request.url), username=(u.searchParams.get('username')||'').trim().toLowerCase();
   if(!/^[a-z0-9_-]{1,30}$/.test(username))return j({error:'Ingresá un usuario de Letterboxd válido.'},400);
-  const store=getStore({name:'letterboxd-watchlists',consistency:'strong'}), key=`wl-${username}`;
+  const store=getStore({name:'letterboxd-watchlists',consistency:'strong'}),key=`wl-${username}`;
+  const token=(process.env.TMDB_READ_ACCESS_TOKEN||'').trim();
   try{
-    const saved=await store.get(key,{type:'json'});
+    let saved=await store.get(key,{type:'json'});
     const fresh=saved?.updatedAt && Date.now()-saved.updatedAt<DAY;
-    if(fresh){
-      const token=process.env.TMDB_READ_ACCESS_TOKEN;
-      const pending=saved.movies.filter(m=>!m.tmdbId);
-      if(!token||!pending.length)return j({...saved,source:'cache'});
-      const batch=pending.slice(0,12);
-      const enriched=await Promise.all(batch.map(m=>enrich(m,token,store)));
-      const replacements=new Map(enriched.map(m=>[m.url,m]));
-      const movies=saved.movies.map(m=>replacements.get(m.url)||m);
-      const out={...saved,movies,enrichmentPending:movies.filter(m=>!m.tmdbId).length};
-      await store.setJSON(key,out);return j({...out,source:'cache'});
+    let data=saved;
+    if(!fresh){
+      try {
+        const list=await scrape(username);
+        if(!list.length)throw Error('La watchlist está vacía o no es pública.');
+        const previous=new Map((saved?.movies||[]).map(m=>[m.url,m]));
+        const movies=list.map(m=>({...m,...(previous.get(m.url)||{}),name:m.name,url:m.url}));
+        data={username,updatedAt:Date.now(),movies};
+      }catch(e){
+        if(!saved?.movies?.length)throw e;
+        data={...saved,stale:true,warning:`No se pudo actualizar Letterboxd: ${e.message}`};
+      }
     }
-    let list;
-    try{list=await scrape(username);}catch(e){if(saved?.movies?.length)return j({...saved,stale:true,warning:e.message});throw e;}
-    if(!list.length)throw Error('La watchlist está vacía o no es pública.');
-    const previous=new Map((saved?.movies||[]).map(m=>[m.url,m]));
-    list=list.map(m=>({...m,...(previous.get(m.url)||{}),name:m.name,url:m.url}));
-    const token=process.env.TMDB_READ_ACCESS_TOKEN;
-    // Enrich only a bounded subset per HTTP request to stay under Netlify function limits.
-    const pending=list.filter(m=>!m.tmdbId);
-    const batch=pending.slice(0,12);
-    const enriched=await Promise.all(batch.map(m=>enrich(m,token,store)));
-    const mapped=new Map(enriched.map(m=>[m.url,m]));list=list.map(m=>mapped.get(m.url)||m);
-    const out={username,updatedAt:Date.now(),movies:list, enrichmentPending:list.filter(m=>!m.tmdbId).length, warning:!token?'Configurá TMDB_READ_ACCESS_TOKEN en Netlify para obtener pósters, duraciones y filtros.':undefined};
-    await store.setJSON(key,out);return j(out);
+    // Every request processes the next batch. The browser continues while data is pending.
+    const syncWarning=data.warning;
+    data=await enrichBatch(data,token,store);
+    if(syncWarning)data.warning=[syncWarning,data.warning].filter(Boolean).join(' ');
+    await store.setJSON(key,data);
+    const enriched=data.movies.filter(m=>m.tmdbId).length;
+    return j({...data,enrichedCount:enriched,source:fresh?'cache':'letterboxd'});
   }catch(e){console.error('watchlist function:',e);return j({error:String(e.message||e)},502);}
 };
