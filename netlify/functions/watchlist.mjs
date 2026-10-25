@@ -109,11 +109,16 @@ async function enrich(movie,token,store){
   await store.setJSON(key,{checkedAt:Date.now(),matched:true,fields});
   return {...movie,...fields,metadataChecked:true};
 }
-async function enrichBatch(data,token,store){
+async function enrichBatch(data,token,store,preferredDecade=null){
   if(!token)return {...data,warning:'TMDB_READ_ACCESS_TOKEN no está disponible en Netlify Functions.',enrichmentPending:data.movies.filter(m=>!(m.metadataChecked||m.tmdbId)).length};
   const pending=data.movies.map((m,i)=>!(m.metadataChecked||m.tmdbId)?i:-1).filter(i=>i>=0);
   if(!pending.length)return {...data,enrichmentPending:0,warning:undefined};
-  const batch=pending.slice(0,8);
+  // When a decade is selected, verify its movies first instead of waiting for the entire watchlist.
+  const ordered = preferredDecade === null ? pending : [
+    ...pending.filter(i => Math.floor(Number(data.movies[i].year)/10)*10 === preferredDecade),
+    ...pending.filter(i => Math.floor(Number(data.movies[i].year)/10)*10 !== preferredDecade)
+  ];
+  const batch=ordered.slice(0,8);
   // A small batch keeps requests well within Netlify Function execution time limits.
   const results=await Promise.all(batch.map(async i=>({index:i,movie:await enrich(data.movies[i],token,store)})));
   const movies=[...data.movies];
@@ -125,6 +130,8 @@ export default async (request)=>{
   if(!/^[a-z0-9_-]{1,30}$/.test(username))return j({error:'Ingresá un usuario de Letterboxd válido.'},400);
   const store=getStore({name:'letterboxd-watchlists',consistency:'strong'}),key=`wl-${username}`;
   const token=(process.env.TMDB_READ_ACCESS_TOKEN||'').trim();
+  const decadeParam=u.searchParams.get('decade');
+  const preferredDecade=/^(18|19|20)\d0$/.test(decadeParam||'')?Number(decadeParam):null;
   try{
     let saved=await store.get(key,{type:'json'});
     const fresh=saved?.updatedAt && Date.now()-saved.updatedAt<DAY;
@@ -143,7 +150,7 @@ export default async (request)=>{
     }
     // Every request processes the next batch. The browser continues while data is pending.
     const syncWarning=data.warning;
-    data=await enrichBatch(data,token,store);
+    data=await enrichBatch(data,token,store,preferredDecade);
     if(syncWarning)data.warning=[syncWarning,data.warning].filter(Boolean).join(' ');
     await store.setJSON(key,data);
     const enriched=data.movies.filter(m=>m.tmdbId).length;

@@ -15,7 +15,7 @@ function initialize(data){
  updateCount();
 }
 function filtered(){return movies.filter(m=>(!$('genre').value||m.genres.includes($('genre').value))&&(!$('country').value||m.countries.includes($('country').value))&&(!$('decade').value||Math.floor(m.year/10)*10===Number($('decade').value))&&(!$('runtime').value||(m.runtime!==null && m.runtime<=Number($('runtime').value))));}
-function updateCount(){const matches=filtered();$('count').textContent=`${matches.length} de ${movies.length} películas coinciden` + (matches.length===0 && $('runtime').value && movies.some(m=>m.runtime===null) ? ' · Todavía hay películas sin duración: completá primero la carga de TMDB.' : '');$('draw').disabled=!matches.length;}
+function updateCount(){const matches=filtered();const decade=$('decade').value;const relevant=movies.filter(m=>!decade || Math.floor(m.year/10)*10===Number(decade));const pending=relevant.filter(m=>!m.metadataChecked && !m.tmdbId).length;$('count').textContent=`${matches.length} de ${movies.length} películas coinciden` + (matches.length===0 && $('runtime').value && movies.some(m=>m.runtime===null) ? ' · Todavía hay películas sin duración: completá primero la carga de TMDB.' : '') + (pending ? ` · ${pending} películas de esta selección pendientes de verificar con TMDB` : '');$('draw').disabled=!matches.length;}
 function draw(){const pool=filtered();if(!pool.length)return;let unshown=pool.filter(x=>!seen.has(x.url||x.name));if(!unshown.length){seen.clear();unshown=pool;}const m=unshown[Math.floor(Math.random()*unshown.length)];seen.add(m.url||m.name);
  const result=$('result');result.replaceChildren();const wrapper=document.createElement('div');wrapper.className='movie';const poster=document.createElement('div');poster.className='poster';
  if(m.poster?.startsWith('https://image.tmdb.org/')){const img=document.createElement('img');img.src=m.poster;img.alt=`Póster de ${m.name}`;img.loading='lazy';img.onerror=()=>{poster.textContent='🎞';};poster.append(img)}else poster.textContent='🎞';wrapper.append(poster);
@@ -23,6 +23,7 @@ function draw(){const pool=filtered();if(!pool.length)return;let unshown=pool.fi
  if(m.countries.length){const p=document.createElement('p');p.textContent=m.countries.map(x=>{try{return regionNames.of(x)}catch{return x}}).join(', ');copy.append(p)}
  if(m.url?.startsWith('https://letterboxd.com/')){const link=document.createElement('a');link.href=m.url;link.target='_blank';link.rel='noopener noreferrer';link.textContent='Ver en Letterboxd ↗';copy.append(link)}wrapper.append(copy);result.append(wrapper);
 }
+function apiUrl(username){const params=new URLSearchParams({username});const decade=$('decade').value;if(decade)params.set('decade',decade);return `/api/watchlist?${params}`;}
 async function loadUser(username){
  username=username.trim().toLowerCase();
  if(!/^[a-z0-9_-]{1,30}$/.test(username)){setStatus('Nombre de usuario inválido.',true);return;}
@@ -30,7 +31,7 @@ async function loadUser(username){
  setStatus('Cargando tu watchlist y sus metadatos…');
  $('username-form').querySelector('button').disabled=true;
  try{
-   let response=await fetch(`/api/watchlist?username=${encodeURIComponent(username)}`);
+   let response=await fetch(apiUrl(username));
    let data=await response.json();
    if(!response.ok)throw Error(data.error||'Error de conexión');
    history.replaceState({},'',`/u/${username}`);lastUrl=location.href;
@@ -41,7 +42,7 @@ async function loadUser(username){
    let attempts=0;
    while(pending>0 && attempts<150 && serial===requestSerial && !data.warning){
      attempts++;
-     response=await fetch(`/api/watchlist?username=${encodeURIComponent(username)}`);
+     response=await fetch(apiUrl(username));
      data=await response.json();
      if(!response.ok)throw Error(data.error||'Error al consultar TMDB');
      if(serial!==requestSerial)return;
