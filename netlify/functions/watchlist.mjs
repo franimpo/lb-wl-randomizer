@@ -8,18 +8,54 @@ const sleep = ms => new Promise(r=>setTimeout(r,ms));
 const cleanTitle = t => String(t||'').replace(/\s*\(\d{4}\)\s*$/, '').trim();
 function normalize(m){return {name:cleanTitle(m.name), year:Number(m.year)||null, url:m.url||null, poster:m.poster||null, runtime:Number(m.runtime)||null, genres:m.genres||[], countries:m.countries||[], tmdbId:m.tmdbId||null};}
 function extract(html) {
-  const $ = cheerio.load(html), found = new Map();
-  $('[data-film-slug], [data-film-name], [data-item-name], .poster-container, .film-poster, .poster').each((_,el)=>{
-    const node=$(el); const inner=node.find('[data-film-slug], [data-film-name], [data-item-name], img').first();
-    const d=node.attr('data-film-name')||node.attr('data-item-name')||inner.attr('data-film-name')||inner.attr('data-item-name')||node.find('img').first().attr('alt')||'';
-    const slug=node.attr('data-film-slug')||inner.attr('data-film-slug')||'';
-    const href=node.find('a[href*="/film/"]').first().attr('href')||node.closest('a[href*="/film/"]').attr('href')|| (slug?`/film/${slug}/`:null);
-    const title=cleanTitle(d);const yr=d.match(/\((\d{4})\)\s*$/)?.[1]||node.attr('data-film-release-year')||null;
-    if(!href||!title||title.toLowerCase()==='poster')return;
-    const path=href.match(/\/film\/([^/?#]+)/)?.[1]; if(!path)return;
-    found.set(path,{name:title,year:yr?Number(yr):null,url:`https://letterboxd.com/film/${path}/`,poster:null,runtime:null,genres:[],countries:[],tmdbId:null});
+  const $ = cheerio.load(html);
+  const found = new Map();
+  const containers = $('li.poster-container, li.griditem, li.posteritem, li[data-film-id], .poster-container, .film-poster, [data-film-slug], [data-target-link], [data-item-name], [data-film-name]');
+  containers.each((_, el) => {
+    const node = $(el);
+    const candidates = node.find('[data-film-slug], [data-target-link], [data-item-name], [data-film-name]');
+    const sources = [node, ...candidates.toArray().map(x => $(x))];
+    const attr = (key) => sources.map(x => x.attr(key)).find(Boolean) || '';
+    const slug = attr('data-film-slug');
+    const filmAnchor = node.find('a[href*="/film/"]').first();
+    const outerAnchor = node.closest('a[href*="/film/"]');
+    const href = attr('data-target-link') || filmAnchor.attr('href') || outerAnchor.attr('href') || (slug ? `/film/${slug}/` : '');
+    const match = href.match(/\/film\/([^/?#]+)\/?/);
+    if (!match) return;
+    const image = node.is('img') ? node : node.find('img').first();
+    let raw = attr('data-film-name') || attr('data-item-name') || image.attr('alt') || filmAnchor.attr('title') || node.attr('title') || '';
+    if (!raw || /^poster$/i.test(raw.trim())) {
+      raw = match[1].replace(/-\d{4}$/, '').replace(/-/g, ' ');
+    }
+    const title = cleanTitle(raw);
+    if (!title) return;
+    const yearMatch = raw.match(/\((\d{4})\)\s*$/);
+    const year = yearMatch?.[1] || attr('data-film-release-year') || match[1].match(/-(\d{4})$/)?.[1] || null;
+    const url = `https://letterboxd.com/film/${match[1]}/`;
+    found.set(url, {name:title,year:year?Number(year):null,url,poster:null,runtime:null,genres:[],countries:[],tmdbId:null});
+  });
+  // Fallback for newer markup with film anchors but no poster-container wrapper.
+  if (!found.size) $('a[href*="/film/"]').each((_,el)=>{
+    const a=$(el), href=a.attr('href')||'', match=href.match(/\/film\/([^/?#]+)\/?/);
+    if(!match)return;
+    const wrapper=a.closest('[data-item-name], [data-film-name], [data-film-slug], li, .griditem');
+    const raw=wrapper.attr('data-item-name')||wrapper.attr('data-film-name')||a.find('img').first().attr('alt')||a.attr('title')||'';
+    // Without actual title metadata, slug-derived names are only a last resort.
+    const name=cleanTitle(raw || match[1].replace(/-\d{4}$/,'').replace(/-/g,' '));
+    if(!name)return;
+    const year=raw.match(/\((\d{4})\)\s*$/)?.[1]||wrapper.attr('data-film-release-year')||null;
+    const url=`https://letterboxd.com/film/${match[1]}/`;
+    found.set(url,{name,year:year?Number(year):null,url,poster:null,runtime:null,genres:[],countries:[],tmdbId:null});
   });
   return [...found.values()];
+}
+function pageDiagnosis(html) {
+  const h=html.toLowerCase();
+  if(h.includes('cf-chl-') || h.includes('challenge-platform') || h.includes('just a moment...') || h.includes('attention required!'))
+    return 'Letterboxd presentó un control antibots a Netlify (Cloudflare). La página no contiene la watchlist.';
+  if(h.includes('log in') && h.includes('private') && h.includes('watchlist'))
+    return 'La watchlist podría estar configurada como privada.';
+  return 'La respuesta de Letterboxd no contiene películas reconocibles. Puede haber cambiado el HTML o estar bloqueando la lectura desde Netlify.';
 }
 async function scrape(username){
   const all=new Map();let previousSize=-1;
@@ -29,7 +65,8 @@ async function scrape(username){
     if(resp.status===404) {if(page===1)throw Error('Usuario inexistente o watchlist inaccesible.');break;}
     if(!resp.ok)throw Error(`Letterboxd bloqueó la consulta (${resp.status}). Podés usar la importación CSV.`);
     const html=await resp.text(); const movies=extract(html);
-    if(page===1&&!movies.length)throw Error('No se pudieron leer películas de la página pública. La estructura de Letterboxd puede haber cambiado. Usá la importación CSV.');
+    console.log(`Letterboxd ${username} page ${page}: HTTP ${resp.status}, ${html.length} chars, ${movies.length} movies`);
+    if(page===1&&!movies.length)throw Error(pageDiagnosis(html));
     if(!movies.length)break;
     previousSize=all.size;
     for(const m of movies)all.set(m.url,m);

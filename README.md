@@ -32,3 +32,11 @@ Netlify CLI inicia la web y las Functions. Abrí la URL local que indique.
 ## Datos y privacidad
 
 Solo se consulta información pública de Letterboxd y se guardan copias en la caché del sitio. No se requiere ni almacena contraseña de Letterboxd. Nunca exponer `TMDB_READ_ACCESS_TOKEN` en el frontend. Para un lanzamiento público revisá los términos, la posibilidad de bloqueo y los límites aplicables.
+
+## Corrección de extracción (25 Oct 2026)
+
+El parser ahora reconoce también `data-target-link`, `data-film-slug`, `data-item-name`, `li.griditem` y variantes del HTML, y registra en los logs la cantidad de películas detectadas por página.
+
+Si sigue mostrando un error de Cloudflare o acceso automatizado, no es posible resolverlo solamente cambiando selectores. La importación CSV se mantiene como alternativa y se necesitará evaluar un mecanismo autorizado de sincronización.
+
+**Esta actualización no fue validada contra una respuesta HTML real de Letterboxd desde Netlify.**
