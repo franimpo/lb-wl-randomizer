@@ -1,0 +1,38 @@
+const $=id=>document.getElementById(id);
+let movies=[], lastUrl='', seen=new Set();
+const regionNames = new Intl.DisplayNames(['es'],{type:'region'});
+const controls=['genre','country','decade','year','runtime'];
+const setStatus=(s,error=false)=>{ $('status').textContent=s;$('status').className='hint'+(error?' error':'');};
+function fillOptions(id,items,display){const s=$(id),old=s.value;s.replaceChildren(new Option(s.options[0]?.textContent||'Todos',''));for(const item of items)s.add(new Option(display(item),String(item)));s.value=old;}
+function initialize(data){
+ movies=(data.movies||[]).map(x=>({...x,year:Number(x.year)||null,runtime:Number(x.runtime)||null,genres:Array.isArray(x.genres)?x.genres:[],countries:Array.isArray(x.countries)?x.countries:[]}));seen.clear();
+ $('workspace').hidden=false;$('profile').textContent='@'+data.username;
+ const fresh=data.updatedAt?new Date(data.updatedAt).toLocaleString('es-AR'):'Importación local';
+ $('meta').textContent=`${movies.length} películas · Actualizado: ${fresh}${data.enrichmentPending?' · '+data.enrichmentPending+' pendientes de TMDB':''}`;
+ fillOptions('genre',[...new Set(movies.flatMap(x=>x.genres))].sort(),x=>x);
+ fillOptions('country',[...new Set(movies.flatMap(x=>x.countries))].sort(),x=>{try{return regionNames.of(x)}catch{return x}});
+ fillOptions('decade',[...new Set(movies.map(x=>x.year&&Math.floor(x.year/10)*10).filter(Boolean))].sort((a,b)=>b-a),x=>`${x}s`);
+ fillOptions('year',[...new Set(movies.map(x=>x.year).filter(Boolean))].sort((a,b)=>b-a),x=>x);
+ updateCount();$('workspace').scrollIntoView({behavior:'smooth',block:'start'});
+}
+function filtered(){return movies.filter(m=>(!$('genre').value||m.genres.includes($('genre').value))&&(!$('country').value||m.countries.includes($('country').value))&&(!$('decade').value||Math.floor(m.year/10)*10===Number($('decade').value))&&(!$('year').value||m.year===Number($('year').value))&&(!$('runtime').value||(m.runtime!==null && m.runtime<=Number($('runtime').value))));}
+function updateCount(){const matches=filtered();$('count').textContent=`${matches.length} de ${movies.length} películas coinciden`;$('draw').disabled=!matches.length;}
+function draw(){const pool=filtered();if(!pool.length)return;let unshown=pool.filter(x=>!seen.has(x.url||x.name));if(!unshown.length){seen.clear();unshown=pool;}const m=unshown[Math.floor(Math.random()*unshown.length)];seen.add(m.url||m.name);
+ const result=$('result');result.replaceChildren();const wrapper=document.createElement('div');wrapper.className='movie';const poster=document.createElement('div');poster.className='poster';
+ if(m.poster?.startsWith('https://image.tmdb.org/')){const img=document.createElement('img');img.src=m.poster;img.alt=`Póster de ${m.name}`;img.loading='lazy';img.onerror=()=>{poster.textContent='🎞';};poster.append(img)}else poster.textContent='🎞';wrapper.append(poster);
+ const copy=document.createElement('div');copy.className='movie-copy';const tag=document.createElement('div');tag.className='tag';tag.textContent='YOUR NEXT MOVIE';copy.append(tag);const h=document.createElement('h2');h.textContent=m.name;copy.append(h);const details=document.createElement('p');details.textContent=[m.year,m.runtime?`${m.runtime} min`:null,...m.genres.slice(0,2)].filter(Boolean).join(' · ');copy.append(details);
+ if(m.countries.length){const p=document.createElement('p');p.textContent=m.countries.map(x=>{try{return regionNames.of(x)}catch{return x}}).join(', ');copy.append(p)}
+ if(m.url?.startsWith('https://letterboxd.com/')){const link=document.createElement('a');link.href=m.url;link.target='_blank';link.rel='noopener noreferrer';link.textContent='Ver en Letterboxd ↗';copy.append(link)}wrapper.append(copy);result.append(wrapper);
+}
+async function loadUser(username){username=username.trim().toLowerCase();if(!/^[a-z0-9_-]{1,30}$/.test(username)){setStatus('Nombre de usuario inválido.',true);return}setStatus('Consultando la watchlist pública… puede demorar la primera vez.');$('username-form').querySelector('button').disabled=true;
+ try{const response=await fetch(`/api/watchlist?username=${encodeURIComponent(username)}`);const data=await response.json();if(!response.ok)throw Error(data.error||'Error de conexión');history.replaceState({},'',`/u/${username}`);lastUrl=location.href;initialize(data);setStatus(data.warning||`${data.movies.length} películas cargadas.${data.stale?' Caché anterior por error de sincronización.':''}`);}
+ catch(e){setStatus(e.message+' Probá importando tu CSV oficial.',true)}finally{$('username-form').querySelector('button').disabled=false;}}
+$('username-form').addEventListener('submit',e=>{e.preventDefault();loadUser($('username').value)});
+for(const id of controls)$(id).addEventListener('change',updateCount);
+$('reset').addEventListener('click',()=>{for(const id of controls)$(id).value='';updateCount()});$('draw').addEventListener('click',draw);
+$('copy-link').addEventListener('click',async()=>{try{await navigator.clipboard.writeText(lastUrl||location.href);$('copy-link').textContent='¡Copiado!';setTimeout(()=>$('copy-link').textContent='Copiar enlace ↗',2000)}catch{alert(location.href)}});
+$('import').addEventListener('click',()=>$('file').click());$('import-toggle').addEventListener('click',()=>$('file').click());
+// CSV parser supporting quoted fields and embedded commas/newlines.
+function parseCSV(text){const rows=[];let row=[],cell='',quoted=false;for(let i=0;i<text.length;i++){let c=text[i];if(c==='"'){if(quoted&&text[i+1]==='"'){cell+='"';i++}else quoted=!quoted}else if(c===','&&!quoted){row.push(cell);cell=''}else if((c==='\n'||c==='\r')&&!quoted){if(c==='\r'&&text[i+1]==='\n')i++;row.push(cell);if(row.some(v=>v.trim()))rows.push(row);row=[];cell=''}else cell+=c;}row.push(cell);if(row.some(v=>v.trim()))rows.push(row);return rows;}
+$('file').addEventListener('change',async e=>{const file=e.target.files?.[0];if(!file)return;const rows=parseCSV((await file.text()).replace(/^\uFEFF/,''));const headers=(rows.shift()||[]).map(s=>s.toLowerCase().trim());const name=headers.indexOf('name'),year=headers.indexOf('year'),uri=headers.indexOf('letterboxd uri');if(name===-1){setStatus('El CSV debe incluir una columna Name.',true);return;}const result=rows.map(r=>({name:r[name]||'',year:year<0?null:parseInt(r[year],10)||null,url:uri<0?null:r[uri],poster:null,runtime:null,genres:[],countries:[]})).filter(x=>x.name);initialize({username:'importación local',movies:result});setStatus('CSV importado en el navegador. Para pósters y filtros avanzados necesitás la sincronización con TMDB.');e.target.value='';});
+const match=location.pathname.match(/^\/u\/([\w-]+)\/?$/);if(match){$('username').value=match[1];loadUser(match[1]);}

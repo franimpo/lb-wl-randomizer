@@ -1,0 +1,14 @@
+[build]
+  publish = "public"
+  command = "echo Static frontend ready"
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+[[redirects]]
+  from = "/api/watchlist"
+  to = "/.netlify/functions/watchlist"
+  status = 200
+[[redirects]]
+  from = "/u/*"
+  to = "/index.html"
+  status = 200
