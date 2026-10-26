@@ -1,28 +1,11 @@
-# Letterboxd Randomizer — v2.1
+# Letterboxd Randomizer v2.3 — Analítica sin aviso visible
 
-Correcciones de filtros, imágenes y enriquecimiento con TMDB.
+Esta variante conserva íntegramente el `index.html` y `style.css` subidos por el usuario, con la única adición de la referencia a `/analytics.js` en HTML. No incluye banner ni estilos nuevos.
 
-## Publicación
+Configurar en Netlify `POSTHOG_PROJECT_TOKEN` y `POSTHOG_REGION` (`us` o `eu`). Mantener `TMDB_READ_ACCESS_TOKEN`.
 
-1. Subí el contenido de este proyecto a tu repositorio (reemplazá archivos existentes).
-2. Netlify: carpeta de publicación `public`. El `netlify.toml` incluido configura las Functions y rutas.
-3. En Netlify > Project configuration > Environment variables, agregá `TMDB_READ_ACCESS_TOKEN` (TMDB API Read Access Token, no API key) en el scope Functions.
-4. Hacé un deploy nuevo. Probá `/u/franimpo`.
+Se miden cuatro eventos: `watchlist_loaded`, `filters_applied`, `movie_randomized`, `letterboxd_opened`. PostHog no tiene grabación, autocaptura ni páginas vistas activas; usa persistencia `memory`, por lo que no reconoce visitantes entre sesiones. El username consultado puede corresponder a una persona y **no debe considerarse un dato anónimo**.
 
-## Qué cambia
+El HTML del usuario contiene Google Analytics; se mantuvo sin cambios. Evaluar requisitos de información/consentimiento para la audiencia y la jurisdicción antes de activar analítica sin aviso.
 
-- Se elimina el filtro de año; se conserva década.
-- Las películas se enriquecen con TMDB en **lotes de ocho**; el cliente solicita lotes sucesivos mientras haya pendientes.
-- Cada lote se almacena en Netlify Blobs para que visitas posteriores reutilicen resultados.
-- En la interfaz aparece un contador de identificadas y pendientes.
-- Búsquedas TMDB con título limpio, coincidencia con título original y margen de un año; no se asignan datos dudosos.
-- Un error de autenticación TMDB detiene las consultas y muestra un mensaje explícito.
-- Si no existe duración en TMDB, esa película no se incluye en un filtro de duración máxima; el contador indica el motivo.
-
-## Limitaciones
-
-- La importación local CSV sigue sin obtener metadatos de TMDB porque se procesa solo en el navegador.
-- Las watchlists grandes pueden requerir varias solicitudes para enriquecer la totalidad; mantené la pestaña abierta durante la primera carga.
-- Si Letterboxd bloquea la extracción a Netlify, la corrección de TMDB no resuelve dicho bloqueo.
-- Los créditos y las condiciones de uso de las APIs de TMDB y Letterboxd deben respetarse si la app se distribuye públicamente.
-- Pruebas realizadas: verificación de sintaxis de JavaScript; aún falta probar la ejecución real en Netlify con el token.
+Publicar el contenido en la raíz del repositorio, manteniendo la carpeta `public/` y `netlify/functions/`.
