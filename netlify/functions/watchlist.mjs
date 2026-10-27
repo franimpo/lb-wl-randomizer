@@ -109,6 +109,59 @@ async function enrich(movie,token,store){
   await store.setJSON(key,{checkedAt:Date.now(),matched:true,fields});
   return {...movie,...fields,metadataChecked:true};
 }
+// Letterboxd publishes its weighted community rating in film-page JSON-LD.
+function findRating(html){
+  const $=cheerio.load(html);
+  for(const el of $('script[type="application/ld+json"]').toArray()){
+    let parsed;try{parsed=JSON.parse($(el).html()||'')}catch{continue}
+    const queue=[parsed];
+    while(queue.length){
+      const node=queue.pop();
+      if(Array.isArray(node)){queue.push(...node);continue}
+      if(!node || typeof node!=='object')continue;
+      const raw=node.aggregateRating?.ratingValue;
+      if(raw!==undefined && raw!==null){
+        const n=Number(raw),max=Number(node.aggregateRating?.bestRating||5);
+        if(Number.isFinite(n)&&n>=0.5&&n<=5&&max===5)return n;
+      }
+      if(node['@graph'])queue.push(node['@graph']);
+    }
+  }
+  return null;
+}
+async function enrichRating(movie,store){
+  if(!/^https:\/\/letterboxd\.com\/film\/[a-z0-9-]+\/$/.test(movie.url||''))
+    return {...movie,letterboxdRating:null,ratingChecked:true};
+  const key=`rating-${encodeURIComponent(new URL(movie.url).pathname)}`;
+  const cached=await store.get(key,{type:'json'});
+  if(cached && Date.now()-cached.checkedAt<(cached.rating!==null?7:1)*DAY){
+    return {...movie,letterboxdRating:cached.rating,ratingChecked:true};
+  }
+  try{
+    const resp=await fetch(movie.url,{headers:{'User-Agent':UA,Accept:'text/html'},signal:AbortSignal.timeout(10000)});
+    if(!resp.ok)throw Error(`Letterboxd HTTP ${resp.status}`);
+    const rating=findRating(await resp.text());
+    await store.setJSON(key,{checkedAt:Date.now(),rating});
+    return {...movie,letterboxdRating:rating,ratingChecked:true};
+  }catch(err){
+    console.warn('Rating unavailable',movie.url,String(err?.message||err));
+    // Keep failed fetches from triggering endless requests; retry with a refreshed watchlist.
+    return {...movie,letterboxdRating:null,ratingChecked:true};
+  }
+}
+async function enrichRatingBatch(data,store,preferredDecade=null){
+  const candidates=data.movies.map((m,i)=>!m.ratingChecked?i:-1).filter(i=>i>=0);
+  if(!candidates.length)return {...data,ratingPending:0};
+  const preferred=preferredDecade===null?candidates:[
+    ...candidates.filter(i=>Math.floor(Number(data.movies[i].year)/10)*10===preferredDecade),
+    ...candidates.filter(i=>Math.floor(Number(data.movies[i].year)/10)*10!==preferredDecade)
+  ];
+  const batch=preferred.slice(0,8);
+  const results=await Promise.all(batch.map(async i=>({index:i,movie:await enrichRating(data.movies[i],store)})));
+  const movies=[...data.movies];
+  for(const {index,movie} of results)movies[index]=movie;
+  return {...data,movies,ratingPending:movies.filter(m=>!m.ratingChecked).length};
+}
 async function enrichBatch(data,token,store,preferredDecade=null){
   if(!token)return {...data,warning:'TMDB_READ_ACCESS_TOKEN no está disponible en Netlify Functions.',enrichmentPending:data.movies.filter(m=>!(m.metadataChecked||m.tmdbId)).length};
   const pending=data.movies.map((m,i)=>!(m.metadataChecked||m.tmdbId)?i:-1).filter(i=>i>=0);
@@ -141,7 +194,7 @@ export default async (request)=>{
         const list=await scrape(username);
         if(!list.length)throw Error('La watchlist está vacía o no es pública.');
         const previous=new Map((saved?.movies||[]).map(m=>[m.url,m]));
-        const movies=list.map(m=>({...m,...(previous.get(m.url)||{}),name:m.name,url:m.url}));
+        const movies=list.map(m=>{const old=previous.get(m.url)||{};return {...m,...old,name:m.name,url:m.url,ratingChecked:old.letterboxdRating!=null?true:false};});
         data={username,updatedAt:Date.now(),movies};
       }catch(e){
         if(!saved?.movies?.length)throw e;
@@ -151,6 +204,7 @@ export default async (request)=>{
     // Every request processes the next batch. The browser continues while data is pending.
     const syncWarning=data.warning;
     data=await enrichBatch(data,token,store,preferredDecade);
+    data=await enrichRatingBatch(data,store,preferredDecade);
     if(syncWarning)data.warning=[syncWarning,data.warning].filter(Boolean).join(' ');
     await store.setJSON(key,data);
     const enriched=data.movies.filter(m=>m.tmdbId).length;
