@@ -88,8 +88,14 @@ async function tmdbFetch(url, token){
 async function enrich(movie,token,store){
   const key=`tmdb-${encodeURIComponent(titleKey(movie.name)+'-'+(movie.year||'sin-ano'))}`;
   const cached=await store.get(key,{type:'json'});
-  if(cached && Date.now()-cached.checkedAt<(cached.matched?90:7)*DAY)
+  if(cached && (!movie.tmdbId || cached.fields?.tmdbRatingChecked) && Date.now()-cached.checkedAt<(cached.matched?90:7)*DAY)
     return {...movie,...(cached.fields||{}),metadataChecked:true};
+  if(movie.tmdbId){
+    const detail=await tmdbFetch(`https://api.themoviedb.org/3/movie/${movie.tmdbId}`,token);
+    const fields={tmdbRating:Number.isFinite(Number(detail.vote_average))&&Number(detail.vote_count)>0?Number(detail.vote_average)/2:null,tmdbRatingChecked:true};
+    await store.setJSON(key,{checkedAt:Date.now(),matched:true,fields:{runtime:movie.runtime,poster:movie.poster,genres:movie.genres,countries:movie.countries,tmdbId:movie.tmdbId,...fields}});
+    return {...movie,...fields,metadataChecked:true};
+  }
   const params=new URLSearchParams({query:cleanTitle(movie.name),include_adult:'false'});
   if(movie.year)params.set('year',String(movie.year));
   let results=(await tmdbFetch(`https://api.themoviedb.org/3/search/movie?${params}`,token)).results||[];
@@ -102,88 +108,16 @@ async function enrich(movie,token,store){
   }
   if(!match){
     await store.setJSON(key,{checkedAt:Date.now(),matched:false,fields:{}});
-    return {...movie,metadataChecked:true};
+    return {...movie,metadataChecked:true,tmdbRatingChecked:true};
   }
   const detail=await tmdbFetch(`https://api.themoviedb.org/3/movie/${match.id}`,token);
-  const fields={runtime:Number(detail.runtime)||null,poster:detail.poster_path?`https://image.tmdb.org/t/p/w500${detail.poster_path}`:null,genres:(detail.genres||[]).map(g=>g.name),countries:(detail.production_countries||[]).map(c=>c.iso_3166_1),tmdbId:match.id};
+  const fields={runtime:Number(detail.runtime)||null,poster:detail.poster_path?`https://image.tmdb.org/t/p/w500${detail.poster_path}`:null,genres:(detail.genres||[]).map(g=>g.name),countries:(detail.production_countries||[]).map(c=>c.iso_3166_1),tmdbId:match.id,tmdbRating:Number(detail.vote_count)>0?Number(detail.vote_average)/2:null,tmdbRatingChecked:true};
   await store.setJSON(key,{checkedAt:Date.now(),matched:true,fields});
   return {...movie,...fields,metadataChecked:true};
 }
-// Letterboxd publishes its weighted community rating in film-page JSON-LD.
-function findRating(html){
-  const $=cheerio.load(html);
-  for(const el of $('script[type="application/ld+json"]').toArray()){
-    let parsed;try{parsed=JSON.parse($(el).html()||'')}catch{continue}
-    const queue=[parsed];
-    while(queue.length){
-      const node=queue.pop();
-      if(Array.isArray(node)){queue.push(...node);continue}
-      if(!node || typeof node!=='object')continue;
-      const r=node.aggregateRating;
-      if(r?.ratingValue!=null){
-        const n=Number(r.ratingValue), max=Number(r.bestRating||5);
-        if(Number.isFinite(n)&&n>=0.5&&n<=5&&max===5)return n;
-      }
-      for(const key of ['@graph','mainEntity','itemListElement'])if(node[key])queue.push(node[key]);
-    }
-  }
-  // Some Letterboxd film pages publish rating in meta tags instead.
-  for(const selector of ['meta[name="twitter:data2"]','meta[itemprop="ratingValue"]']){
-    const raw=$(selector).attr('content')||'';
-    const n=Number(raw.match(/([0-5](?:\.\d+)?)/)?.[1]);
-    if(Number.isFinite(n)&&n>=0.5&&n<=5)return n;
-  }
-  return null;
-}
-async function enrichRating(movie,store){
-  let url;
-  try { url=new URL(movie.url); }catch{return {...movie,letterboxdRating:null,ratingChecked:true,ratingStatus:'invalid_url'};}
-  if(url.hostname!=='letterboxd.com' || !/^\/film\/[a-z0-9-]+\/?$/.test(url.pathname))
-    return {...movie,letterboxdRating:null,ratingChecked:true,ratingStatus:'invalid_url'};
-  const canonical=`https://letterboxd.com${url.pathname.replace(/\/?$/,'/')}`;
-  const key=`rating-${encodeURIComponent(new URL(canonical).pathname)}`;
-  const cached=await store.get(key,{type:'json'});
-  if(cached && Date.now()-cached.checkedAt<(cached.rating!=null?7*DAY:6*60*60*1000)){
-    return {...movie,letterboxdRating:cached.rating,ratingChecked:true,ratingStatus:cached.status||'cached',ratingCheckedAt:cached.checkedAt};
-  }
-  try{
-    const resp=await fetch(canonical,{headers:{'User-Agent':UA,Accept:'text/html'},signal:AbortSignal.timeout(10000)});
-    if(!resp.ok)throw Error(`Letterboxd HTTP ${resp.status}`);
-    const html=await resp.text();
-    if(html.includes('cf-chl-')||html.includes('challenge-platform'))throw Error('Letterboxd antibot');
-    const rating=findRating(html);
-    const status=rating!=null?'ok':'not_found';
-    const checkedAt=Date.now();
-    await store.setJSON(key,{checkedAt,rating,status});
-    return {...movie,letterboxdRating:rating,ratingChecked:true,ratingStatus:status,ratingCheckedAt:checkedAt};
-  }catch(err){
-    const status=`error: ${String(err?.message||err).slice(0,100)}`;
-    console.warn('Rating unavailable',canonical,status);
-    const checkedAt=Date.now();
-    await store.setJSON(key,{checkedAt,rating:null,status});
-    return {...movie,letterboxdRating:null,ratingChecked:true,ratingStatus:status,ratingCheckedAt:checkedAt};
-  }
-}
-async function enrichRatingBatch(data,store,preferredDecade=null){
-  const now=Date.now();
-  const candidates=data.movies.map((m,i)=>{
-    const stale=m.letterboxdRating==null && (m.ratingCheckedAt == null || now-m.ratingCheckedAt>6*60*60*1000);
-    return (!m.ratingChecked || stale)?i:-1;
-  }).filter(i=>i>=0);
-  if(!candidates.length)return {...data,ratingPending:0};
-  const preferred=preferredDecade===null?candidates:[
-    ...candidates.filter(i=>Math.floor(Number(data.movies[i].year)/10)*10===preferredDecade),
-    ...candidates.filter(i=>Math.floor(Number(data.movies[i].year)/10)*10!==preferredDecade)
-  ];
-  const batch=preferred.slice(0,8);
-  const results=await Promise.all(batch.map(async i=>({index:i,movie:await enrichRating(data.movies[i],store)})));
-  const movies=[...data.movies];
-  for(const {index,movie} of results)movies[index]=movie;
-  return {...data,movies,ratingPending:movies.filter(m=>!m.ratingChecked).length};
-}
 async function enrichBatch(data,token,store,preferredDecade=null){
-  if(!token)return {...data,warning:'TMDB_READ_ACCESS_TOKEN no está disponible en Netlify Functions.',enrichmentPending:data.movies.filter(m=>!(m.metadataChecked||m.tmdbId)).length};
-  const pending=data.movies.map((m,i)=>!(m.metadataChecked||m.tmdbId)?i:-1).filter(i=>i>=0);
+  if(!token)return {...data,warning:'TMDB_READ_ACCESS_TOKEN no está disponible en Netlify Functions.',enrichmentPending:data.movies.filter(m=>(!m.metadataChecked && !m.tmdbId) || (m.tmdbId && !m.tmdbRatingChecked)).length};
+  const pending=data.movies.map((m,i)=>(!m.metadataChecked && !m.tmdbId) || (m.tmdbId && !m.tmdbRatingChecked)?i:-1).filter(i=>i>=0);
   if(!pending.length)return {...data,enrichmentPending:0,warning:undefined};
   // When a decade is selected, verify its movies first instead of waiting for the entire watchlist.
   const ordered = preferredDecade === null ? pending : [
@@ -195,7 +129,7 @@ async function enrichBatch(data,token,store,preferredDecade=null){
   const results=await Promise.all(batch.map(async i=>({index:i,movie:await enrich(data.movies[i],token,store)})));
   const movies=[...data.movies];
   for(const {index,movie} of results)movies[index]=movie;
-  return {...data,movies,enrichmentPending:movies.filter(m=>!(m.metadataChecked||m.tmdbId)).length,warning:undefined};
+  return {...data,movies,enrichmentPending:movies.filter(m=>(!m.metadataChecked && !m.tmdbId) || (m.tmdbId && !m.tmdbRatingChecked)).length,warning:undefined};
 }
 export default async (request)=>{
   const u=new URL(request.url), username=(u.searchParams.get('username')||'').trim().toLowerCase();
@@ -213,7 +147,7 @@ export default async (request)=>{
         const list=await scrape(username);
         if(!list.length)throw Error('La watchlist está vacía o no es pública.');
         const previous=new Map((saved?.movies||[]).map(m=>[m.url,m]));
-        const movies=list.map(m=>{const old=previous.get(m.url)||{};return {...m,...old,name:m.name,url:m.url,ratingChecked:old.letterboxdRating!=null?true:!!old.ratingChecked,ratingCheckedAt:old.ratingCheckedAt||null};});
+        const movies=list.map(m=>{const old=previous.get(m.url)||{};return {...m,...old,name:m.name,url:m.url};});
         data={username,updatedAt:Date.now(),movies};
       }catch(e){
         if(!saved?.movies?.length)throw e;
@@ -223,10 +157,10 @@ export default async (request)=>{
     // Every request processes the next batch. The browser continues while data is pending.
     const syncWarning=data.warning;
     data=await enrichBatch(data,token,store,preferredDecade);
-    data=await enrichRatingBatch(data,store,preferredDecade);
+    // Calificaciones desde TMDB; no se consultan páginas individuales de Letterboxd.
     if(syncWarning)data.warning=[syncWarning,data.warning].filter(Boolean).join(' ');
     await store.setJSON(key,data);
     const enriched=data.movies.filter(m=>m.tmdbId).length;
-    return j({...data,ratingVerifiedCount:data.movies.filter(m=>m.letterboxdRating!=null).length,ratingUnavailableCount:data.movies.filter(m=>m.ratingChecked&&m.letterboxdRating==null).length,enrichedCount:enriched,source:fresh?'cache':'letterboxd'});
+    return j({...data,ratingVerifiedCount:data.movies.filter(m=>m.tmdbRating!=null).length,ratingPending:data.movies.filter(m=>!m.tmdbRatingChecked && m.tmdbId).length,enrichedCount:enriched,source:fresh?'cache':'letterboxd'});
   }catch(e){console.error('watchlist function:',e);return j({error:String(e.message||e)},502);}
 };
